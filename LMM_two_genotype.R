@@ -1,6 +1,6 @@
 # Title: Linear mixed-effects model (LMM) for 2-genotype data   #
 # Author: Daven Rock                                            #
-# Date: 1/26/26                                                 #
+# Date: 5/14/26                                                 #
 # Project: Thalamus-derived glutamate is required for early     #
 # specification of layer 4 neurons in the sensory cortex        #
 # Description: Shiny app that performs linear mixed-effects     #
