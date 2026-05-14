@@ -1,0 +1,548 @@
+---
+title: "Statistics and Plotting of Cells Analyzed with ImageJ and R"
+author: "Tim Monko"
+date: "`r Sys.Date()`"
+runtime: shiny
+output: 
+  html_notebook: 
+    theme: spacelab
+    toc: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r global_options, include = FALSE}
+
+library(tidyverse) # Includes ggplot2, tidyr, dplyr, stringr, readr, tibble, purrr, forcats
+library(svglite) # For exporting plots as .svg graphics to use as vector format
+library(extrafont) # README: https://cran.r-project.org/web/packages/extrafont/README.html
+#font_import(path = 'C:/Users/TimMonko/AppData/Local/Microsoft/Windows/Fonts') # for custom installed .ttf fonts
+library(broom) # Tidy's up some statistical outputs
+library(ggh4x)
+library(MANOVA.RM)
+library(rstatix)
+library(ggpubr)
+library(shiny) # Not needed when running as .Rmd, but when working through individual chunks it is necessary to load (the YAML header does it with runtime:shiny during .Rmd)
+library(shinyjqui) # For drag and drop functions such as orderInput
+library(knitr) # Helpful for some functions when not running as .Rmd as with shiny
+library(DT) # Use this for rendering datatable as html output widgets (shiny:: and DT:: share renderDataTable) 
+
+`%notin%` = Negate(`%in%`) # Custom function used to define a group by what is NOT in the group
+```
+
+```{r data_management, echo = FALSE}
+# All "Global", non-shiny variables that are available can be found here. Un-reactive dataframes are necessary for Shiny inputs
+
+# get and load ".csv" files in the working directory of the current .Rmd file
+wd.path <- getwd()
+file.paths <- list.files(path = wd.path, pattern = '\\.csv$')
+
+# function binds .csv's loaded into file.paths. They are bound according to sharing a certain pattern of text (such as 'centers'). This maintains legacy saving of data variables where there was 'all_centers' and 'pair_mean' outputs, etc., from the analysis file
+# In the future this could be modified to use tidyverse style code, but instead relies on baseR lapply
+csv_bind <- function(wd.path = getwd(), text.pattern){
+  bound <- do.call(rbind,
+                    lapply(list.files(path = wd.path, pattern = text.pattern),
+                           function(x) read_csv(x, col_names = TRUE, show_col_types = FALSE)))
+  return(bound)
+}
+
+all.data <- csv_bind(text.pattern = 'centers') # Uses above function to collect all .csv's with the text.pattern and create the main df
+
+# Collect unreactive variable names for Shiny input
+var.names <- all.data %>%
+  pivot_wider(names_from = z, names_prefix = "z") %>%
+  select(contains("z")) %>%
+  colnames()
+
+rm.groups <- paste0(unique(all.data$region), "-", unique(all.data$pair)) # Var for removing variables 
+```
+
+# Interaction to prepare the data set for analysis. 
+
+``` {r factoring_data, echo = FALSE}
+wellPanel(
+  orderInput("z.ord", label = "Slice", items = unique(all.data$z)),
+  orderInput("genotype.ord", label = "Genotype", items = unique(all.data$genotype)),
+  orderInput("pair.ord", label = "Pair", items = unique(all.data$pair)),
+  orderInput("region.ord", label = "Region", items = unique(all.data$region)),
+  orderInput("age.ord", label = "Age", items = unique(all.data$age)),
+  orderInput("edu.ord", label = "EdU", items = unique(all.data$edu))
+)
+inputPanel(
+  selectizeInput("numerator", label = "Numerator slice", choices = var.names, multiple = TRUE, options = list(create = TRUE)),
+  selectizeInput("denominator", label = "Denominator slice", choices = var.names, multiple = TRUE, options = list(create = TRUE)),
+  selectizeInput("outlier.rm", label = "Outliers to remove", choices = rm.groups, multiple = TRUE),
+  numericInput("rescale", label = "rescale px/um", value = 0.63492)
+)
+```
+
+# Data Tables {.tabset}
+
+## All data
+
+Original data shown with user modifications of factor types and order with mathematical operations performed such as rescaled position
+
+``` {r data_manipulation, echo = FALSE}
+# Uses wellPanel inputs from factoring_data to organize the table and have consistent column naming, then displays the table
+# This is the "Master" version of the data
+re.all.data <- reactive({
+  all.data %>% 
+    mutate(z = ordered(z, levels = input$z.ord)) %>%
+    mutate(genotype = ordered(genotype, levels = input$genotype.ord)) %>%
+    mutate(pair = ordered(pair, levels = input$pair.ord)) %>%
+    mutate(region = ordered(region, levels = input$region.ord)) %>%
+    mutate(region.pair = paste0(region, "-", pair)) %>%
+    mutate(age = ordered(age, levels = input$age.ord)) %>%
+    mutate(edu = ordered(edu, levels = input$edu.ord)) %>%
+    # mutate(x.abs.right = (width-x)*input$rescale) %>%
+    # mutate(x.abs.left = x*input$rescale) %>%
+    # mutate(x.rel.right = x/width) %>%
+    filter(region.pair %notin% input$outlier.rm)
+})
+
+renderText("All Data")
+renderDT(re.all.data(), filter="top", class = 'nowrap', options = list(pageLength = 5, scrollX=TRUE))
+```
+## Summarized across images
+
+Data in wide format visualized as grouped by: file, genotype, z (slice), pair and region.
+This will look familiar to how most scientists would entire the data, this is known as "Wide" format, while the other data, such as "All data" is in long data format, which is easier to use data analysis on. 
+
+```{r summarized_data, echo = FALSE}
+
+re.file.data <- reactive({
+  re.all.data() %>%
+    group_by(file, genotype, z, pair, region) %>%
+    summarize(n.cells = mean(n)) # mean is not really a required function, and should be changed , but need to have a summarize function and mean is safe since they are all designed to be the 
+})  
+re.file.wide <- reactive({
+  re.file.data() %>%
+    pivot_wider(id_cols = c(file, genotype, pair, region), names_from = z, values_from = n.cells, names_prefix = "z")
+})  
+    
+renderDT(re.file.wide(), filter="top", class = 'nowrap', options = list(pageLength = 5, scrollX=TRUE))
+```
+## Summarized across pairs {.active}
+Data summarized across pairs
+
+```{r summarized_pair, echo = FALSE}
+# Uses the above data to summarize on a per slice basis rather than on a per cell basis (i.e. in all data each cell measurement is represented along with n for the whole slice)
+# Then, summarizes such that data is meaned per brain, as in technical replicates are averaged
+re.pair.data <- reactive({
+  re.all.data() %>%
+    group_by(file, genotype, z, pair, region) %>%
+    summarize(n.cells = mean(n)) %>%  # This is required because each original row represents one cell, so if the mean is taken without take file into consideration then it will be biased towards slices with more cells (because 552n*552rows is greater than 440n*440rows)
+    group_by(genotype, z, pair, region) %>%
+    summarize(n.cells.mean = mean(n.cells), n.sd.cells = sd(n.cells))
+})
+
+renderDT(re.pair.data(), filter="top", class = 'nowrap', options = list(pageLength = 5, scrollX=TRUE))
+```
+
+## Relative pair data 
+
+```{r relative_data, echo=FALSE}
+
+#The summarized pair data above is then grouped (by slice, pair and region) and divided according to grouping such that CKO is divided by WT to creative a relative difference
+# The log of the relative difference is used because relative to 1 is not linear, but difference from 0 (as with log) can be used for comparison statistically
+re.relative.pair.data <- reactive({
+  re.pair.data() %>%
+    group_by(z, pair, region) %>%
+    summarize(CKO.rel = n.cells.mean[genotype == "CKO"]/n.cells.mean[genotype == "WT"]) %>%
+    mutate(CKO.log = log(CKO.rel))
+})
+
+renderDT(re.relative.pair.data(), filter="top", options = list(pageLength = 5, scrollX=TRUE))
+```
+
+## Slice Ratio Data 
+
+  Divide numerator selection by denominator
+```{r relative_slice_new, echo = FALSE}
+
+# Widen mean cell data to select out dataframes for division
+re.divide.data <- reactive({
+  re.pair.data() %>%
+    group_by(genotype, pair, region) %>%
+    pivot_wider(id_cols = c(genotype, pair, region), names_from = z, values_from = n.cells.mean, names_prefix = "z")
+})
+
+#User input for selected numerator df and then denominator df
+re.numerator <- reactive({
+  re.divide.data() %>% 
+    ungroup() %>%
+    select(input$numerator)
+})
+
+re.denominator <- reactive({
+  re.divide.data() %>% 
+    ungroup() %>%
+    select(input$denominator)
+})
+
+# Matrix multipication using base R to create datasets
+re.divide <- reactive({
+  re.numerator() / re.denominator()
+})
+
+# Gets column names by pasting the user input numerator and denominator together for rename_with
+re.col.new <- reactive({
+  paste(input$numerator, input$denominator, sep = ".")
+})
+
+# rename_with to overwrite with function matching of column names to get new columns
+# https://stackoverflow.com/questions/20987295/rename-multiple-columns-by-names
+re.divide2 <- reactive({
+  re.divide() %>%
+    rename_with(~ re.col.new()[which(input$numerator == .x)], .cols = input$numerator)
+})
+
+# Combine datasets, they are ungrouped but not ever resorted so which match in length, bind_cols is very generic, but  will work because of no other data modiifcation in between 
+re.divide.bind <- reactive({
+  bind_cols(re.divide.data()[1:3], re.divide2()) %>%
+    pivot_longer(cols = starts_with("z"), names_to = "z", values_to = "ratio")
+})
+
+renderDT(re.divide.bind(), filter="top", options = list(pageLength = 5, scrollX=TRUE))
+```
+
+# Statistics {.tabset}
+## Summary Stats Between Genotypes and Pairs
+This tab provides information on *pairs* within a genotype that may be outliers for the overall set of data. Outliers are determined by values above Q3 + 1.5xIQR or below Q1 - 1.5xIQR. Extreme outliers are quartiles +/- 3xIQR
+
+```{r summary_between, echo = FALSE}
+
+summary.between <- reactive({
+  re.pair.data() %>%
+    group_by(genotype, region, z) %>%
+    select(-n.sd.cells)
+})
+
+renderDT(get_summary_stats(summary.between(), type = "common"), filter="top", options = list(pageLength = 5, scrollX=TRUE))
+
+renderDT(identify_outliers(summary.between(), n.cells.mean), filter = "top", options = list(pageLength = 5, scrollX=TRUE))
+```
+
+## Summary Stats Within Brains
+
+This tab provides information on *images* that may be heavily skewing the data within a single brain. The data is organized across genotype, region, z, pair. Investigated this data will allow for inferences about unusual images. Outliers are determined by values above Q3 + 1.5xIQR or below Q1 - 1.5xIQR. Extreme outliers are quartiles +/- 3xIQR
+
+```{r summary_within_brains, echo = FALSE}
+
+summary.within <- reactive({
+  re.file.data() %>%
+    group_by(genotype, region, z, pair)
+})
+
+renderDT(get_summary_stats(summary.within(), type = "common"), filter="top", options = list(pageLength = 5, scrollX=TRUE))
+
+renderDT(identify_outliers(summary.within(), n.cells), filter = "top", options = list(pageLength = 5, scrollX=TRUE))
+```
+
+## Log t_test {.active}
+
+```{r log_stats, echo = FALSE}
+log.t <- reactive({
+  re.relative.pair.data() %>%
+    group_by(z, region) %>%
+    t_test(CKO.log ~ 0, mu = 0) %>%
+    add_significance() %>%
+    mutate(p.signif = recode(p.signif,"ns"= "")) %>%
+    mutate(p = round(p, digits = 3)) %>%
+    mutate(p = format(p, digits = 3)) %>%
+    mutate(p = replace(p, p == 0, "<0.001"))
+})
+
+renderDT(log.t(), options = list(pageLength = 5, scrollX=TRUE))
+```
+
+## Paired t_test
+
+```{r paired_stats, echo = FALSE}
+
+paired.t.ratio <- reactive({
+  re.divide.bind() %>%
+    group_by(z, region) %>%
+    t_test(ratio ~ genotype, paired = TRUE) %>%
+    add_significance() %>%
+    add_xy_position() %>%
+    mutate(p.signif = recode(p.signif,"ns"= "")) %>%
+    mutate(p = round(p, digits = 3)) %>%
+    mutate(p = format(p, digits = 3)) %>%
+    mutate(p = replace(p, p == 0, "<0.001"))
+})
+  
+renderDT(paired.t.ratio(), options = list(pageLength = 5, scrollX=TRUE))
+```
+
+# Plotting {.tabset}
+
+```{r theme_parameters, echo = FALSE}
+cbp.Rel <-c('#999999', '#E69F00', '#56B4E9', '#009E73', '#D55E00', '#0072B2', '#CC79A7', "black", "purple", "orange", "yellow", "red","black","black","black","black")
+cbp.Genotype <- c('#d95f02', '#7570b3')
+# This ggplot theme-based function creates an excellent set of theme parameters, thus freeing up plotting functions to only rely strictly on plot-specific arguments. Unfortunately, plot arguments such as the size of a printed p.value can not be passed to the theme argument. This function relys strictly on theme() argument possibilities. Not having this in a separate package will be very helpful for future users of the code to not have to install a package. 
+theme_Tim <- function(base.size = 7,
+                      text.family = 'Helvetica',
+                      line.color = 'black',
+                      bg.color = "transparent"
+){
+  theme_classic(base_size = base.size) + # 7, if not being shown on screen 
+    theme(
+      text = element_text(family = text.family),
+      title = element_text(family = text.family),
+      axis.line = element_line(color = line.color),
+      panel.background = element_rect(fill = "transparent"), # bg of the panel
+      plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+      legend.background = element_rect(fill = "transparent", color = NA), # get rid of legend bg
+      legend.box.background = element_rect(fill = "transparent", color = NA), # get rid of legend panel bg
+      legend.key = element_rect(fill = "transparent", colour = NA), # get rid of key legend fill, and of the surrounding
+      strip.background = element_rect(fill = "transparent")
+    )
+}
+```
+
+## Log Plot
+
+```{r log.plot, echo = FALSE}
+# Preparing any kind of graph to be plotted, since that is most necessary
+
+inputPanel(
+  selectizeInput("l.z.plot", label = "slices to plot", choices = unique(all.data$z), multiple = TRUE, options = list(create = TRUE)),
+  selectizeInput("l.scale.labels", label = "scale labels", choices = NULL, multiple = TRUE, options = list(create = TRUE)),
+  textInput("l.y.label", label = "y-axis title", value = "Rel. Cell# CKO/WT"),
+  sliderInput("l.p.val.pos", label = "p-value position", value = 1.02, min = 0.5, max = 1.5, step = 0.01),
+  selectizeInput("l.yaxis", label = "y-axis type", choices = c("auto","manual"), selected = "auto"),
+  sliderInput("l.ylim", label = "y-limits", min = 0, max = 5, value = c(0.1,1.5), step = 0.05)
+)
+
+l.y.limits <- reactive({
+  if (input$l.yaxis == "auto") {NULL}
+  else {input$l.ylim}
+})
+
+re.relative.pair.plot <- reactive({
+  re.relative.pair.data() %>%
+    filter(z %in% input$l.z.plot)
+})
+
+log.t.plot <- reactive({
+  log.t() %>%
+    filter(z %in% input$l.z.plot)
+})
+renderDT(log.t.plot())
+# Function argument defaults are great and represent the original plots used in the original Gbx2 cKO pre-print. The only new variable is point.size, which has been added to satisfy readability on the notebook output. Matching the original point.size (as in geom_jitter(size = point.size)) is tricky because according to vignette("ggplot2-specs"), there is no default value for size. 
+fun_log_plot <- function(facet.strip.pos = 'bottom',
+                         point.size = 1,
+                         p.val.size = 2,
+                         y.breaks.major = 0.2,
+                         y.breaks.minor = 0.1,
+                         legend.size = 2.5
+                         ){
+  reactive({
+    ggplot(re.relative.pair.plot(), aes(x = z, y = CKO.rel, colour = z, fill = z, shape = z)) +
+      facet_nested_wrap(~region, strip.position = facet.strip.pos, nrow = 1) +
+      stat_summary(fun = "mean", geom = "col", width = 0.8, show.legend = FALSE) +
+      geom_hline(aes(yintercept = 1), linetype = 'dashed') +
+      geom_jitter(width = 0.1, size = point.size) +
+      stat_pvalue_manual(log.t.plot(), x = "z", label = "{p}", y.position = input$l.p.val.pos, size = p.val.size, srt = 0) +
+      scale_fill_manual(values = alpha(cbp.Rel, 0.25), name = NULL, labels = input$l.scale.labels) +
+      scale_colour_manual(values = cbp.Rel, name = NULL, labels = input$l.scale.labels) +
+      scale_shape_manual(values = c(21,22,24,23,25,10,12), name = NULL, labels = input$l.scale.labels) +
+      labs(y = input$l.y.label,
+       x = NULL) + # can use element_blank for no label at all
+      scale_x_discrete(breaks = NULL) +
+      scale_y_continuous(trans = "log10", breaks = seq(0,10,y.breaks.major), minor_breaks = seq(0,10,y.breaks.minor), guide = "axis_minor", limits = l.y.limits()) + #guide + "axis_minor" from ggh4x package
+      guides(color = guide_legend(override.aes = list(size = legend.size))) +
+      coord_cartesian(clip = "off")
+  })
+}
+
+log.plot <- fun_log_plot(point.size = 4, p.val.size = 6, legend.size = 5)
+renderPlot(log.plot() + theme_Tim(base.size = 20))
+```
+
+### Saving the Plot 
+``` {r saving_log, echo = FALSE}
+## ADD REACTIVE HERE for file name
+inputPanel(
+  textInput("l.filename", label = "Plot Name", placeholder = "Your input here"),
+  radioButtons("l.filetype", label = "File Type", choices = c('pdf', 'png','svg')),
+  sliderInput("l.plot.width", label = "Plot Width, cm", min = 1, max = 12, value = 6, step = 0.5),
+  sliderInput("l.plot.height", label = "Plot Height, cm", min = 1, max = 8, value = 3, step = 0.5),
+  actionButton("l.filesave", label = "Save File")
+)
+
+# This event reactive causes the ggsave to wait because it requires input from the reactive filename function. I'm not sure that this is the most efficient, because potentially ggsave should also be eventReactive. Largely, this event reactivity is important so that ggsave does not save a new file for each character that is typed. 
+l.filename.evre <- eventReactive(input$l.filesave, {
+   paste0(wd.path, "/", input$l.filename, ".", input$l.filetype)
+})
+
+# Make this a function later, to then only print a specific plot
+l.print.plot <- fun_log_plot()
+l.print.plot2 <- reactive(l.print.plot() + theme_Tim())
+
+reactive(ggsave(plot = l.print.plot2(), filename = l.filename.evre(), device = input$l.filetype, width = input$l.plot.width, height = input$l.plot.height, unit = 'cm', dpi = 300, bg = "transparent")) # back in a previous version of ggsave/svglite, a 1.32 conversion was required because it was printed from 70 to 96dpi conversion factor. Nowadays, this appears to be fixed for all file types, so no requirement to have a dpi conversion factor. Also, .pdf is the preferable 
+```
+
+## Variability Plot
+
+```{r var.plot, echo = FALSE}
+# Preparing any kind of graph to be plotted, since that is most necessary
+
+inputPanel(
+  selectizeInput("v.z.plot", label = "slices to plot", choices = unique(all.data$z), multiple = TRUE, options = list(create = TRUE)),
+  selectizeInput("v.scale.labels", label = "scale labels", choices = NULL, multiple = TRUE, options = list(create = TRUE)),
+  textInput("v.y.label", label = "y-axis title", value = "Rel. Cell# CKO/WT"),
+  sliderInput("v.p.val.pos", label = "p-value position", value = 1.02, min = 0.5, max = 1.5, step = 0.01),
+  selectizeInput("v.yaxis", label = "y-axis type", choices = c("auto","manual"), selected = "auto"),
+  sliderInput("v.ylim", label = "y-limits", min = 0, max = 1000, value = c(0,500), step = 50)
+)
+
+v.y.limits <- reactive({
+  if (input$v.yaxis == "auto") {NULL}
+  else {input$v.ylim}
+})
+
+re.file.plot <- reactive({
+  re.file.data() %>%
+    filter(z %in% input$v.z.plot)
+})
+
+fun_var_plot <- function(facet.strip.pos = 'bottom',
+                         point.size = 1,
+                         p.val.size = 2,
+                         y.breaks.major = 0.2,
+                         y.breaks.minor = 0.1,
+                         legend.size = 2.5
+                         ){
+  reactive({
+    ggplot(re.file.plot(), aes(x = genotype, y = n.cells, colour = pair, fill = pair, shape = pair)) +
+      facet_nested_wrap(~region * z * pair, strip.position = facet.strip.pos, nrow = 1) +
+      stat_summary(fun = "mean", geom = "point", size = 5, shape = "o") +
+      stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, show.legend = FALSE) +
+      geom_jitter(width = 0.1, size = point.size) +
+      # stat_pvalue_manual(log.t.plot(), x = "z", label = "{p}", y.position = input$l.p.val.pos, size = p.val.size, srt = 0) +
+      scale_fill_manual(values = alpha(cbp.Rel, 0.25), name = NULL, labels = input$v.scale.labels) +
+      scale_colour_manual(values = cbp.Rel, name = NULL, labels = input$v.scale.labels) +
+      scale_shape_manual(values = c(21,22,24,23,25,10,12,13,14,15,16,17,18,19,20,21), name = NULL, labels = input$zv.scale.labels) +
+      labs(y = input$v.y.label,
+           x = NULL) + # can use element_blank for no label at all
+      scale_x_discrete(breaks = NULL) +
+      scale_y_continuous(limits = v.y.limits()) + #guide + "axis_minor" from ggh4x package
+      guides(color = guide_legend(override.aes = list(size = legend.size))) +
+      coord_cartesian(clip = "off")
+  })
+}
+
+var.plot <- fun_var_plot(point.size = 4, p.val.size = 6, legend.size = 5)
+renderPlot(var.plot() + theme_Tim(base.size = 20))
+```
+
+### Saving the Plot 
+``` {r saving_var, echo = FALSE}
+## ADD REACTIVE HERE for file name
+inputPanel(
+  textInput("v.filename", label = "Plot Name", placeholder = "Your input here"),
+  radioButtons("v.filetype", label = "File Type", choices = c('pdf', 'png','svg')),
+  sliderInput("v.plot.width", label = "Plot Width, cm", min = 1, max = 12, value = 6, step = 0.5),
+  sliderInput("v.plot.height", label = "Plot Height, cm", min = 1, max = 8, value = 3, step = 0.5),
+  actionButton("v.filesave", label = "Save File")
+)
+
+# This event reactive causes the ggsave to wait because it requires input from the reactive filename function. I'm not sure that this is the most efficient, because potentially ggsave should also be eventReactive. Largely, this event reactivity is important so that ggsave does not save a new file for each character that is typed. 
+v.filename.evre <- eventReactive(input$v.filesave, {
+   paste0(wd.path, "/", input$v.filename, ".", input$v.filetype)
+})
+
+# Make this a function later, to then only print a specific plot
+v.print.plot <- fun_var_plot()
+v.print.plot2 <- reactive(v.print.plot() + theme_Tim())
+
+reactive(ggsave(plot = v.print.plot2(), filename = v.filename.evre(), device = input$v.filetype, width = input$v.plot.width, height = input$v.plot.height, unit = 'cm', dpi = 300, bg = "transparent")) # back in a previous version of ggsave/svglite, a 1.32 conversion was required because it was printed from 70 to 96dpi conversion factor. Nowadays, this appears to be fixed for all file types, so no requirement to have a dpi conversion factor. Also, .pdf is the preferable 
+```
+
+## Ratio Plot
+
+```{r ratio.plot, echo = FALSE}
+
+inputPanel(
+  selectizeInput("r.z.plot", label = "slices to plot", choices = unique(all.data$z), multiple = TRUE, options = list(create = TRUE)),
+  selectizeInput("r.scale.labels", label = "scale labels", choices = NULL, multiple = TRUE, options = list(create = TRUE)),
+  textInput("r.y.label", label = "y-axis title", value = "Rel. Cell# CKO/WT"),
+  sliderInput("r.p.val.pos", label = "p-value nudge", value = 0.005, min = -0.1, max = 0.1, step = 0.001),
+  selectizeInput("r.yaxis", label = "y-axis type", choices = c("auto","manual"), selected = "auto"),
+  sliderInput("r.ylim", label = "y-limits", min = 0, max = 5, value = c(0.1,1.5), step = 0.05)
+)
+
+r.y.limits <- reactive({
+  if (input$r.yaxis == "auto") {NULL}
+  else {input$r.ylim}
+})
+
+plot.ratio.data <- reactive({
+  re.divide.bind() %>%
+    filter(z %in% input$r.z.plot)
+})
+
+paired.t.plot <- reactive({
+  paired.t.ratio() %>%
+    filter(z %in% input$r.z.plot)
+})
+
+# Function argument defaults are great and represent the original plots used in the original Gbx2 cKO pre-print. The only new variable is point.size, which has been added to satisfy readability on the notebook output. Matching the original point.size (as in geom_jitter(size = point.size)) is tricky because according to vignette("ggplot2-specs"), there is no default value for size. 
+fun_ratio_plot <- function(facet.strip.pos = 'bottom', 
+                         point.size = 1,
+                         p.val.size = 2,
+                         y.breaks.major = 0.2,
+                         y.breaks.minor = 0.1,
+                         legend.size = 2.5
+                         ){
+  reactive({
+    ggplot(plot.ratio.data(), aes(x = genotype, y = ratio, colour = genotype)) +
+      facet_nested_wrap(~region, strip.position = facet.strip.pos, nrow = 1) +
+      stat_summary(fun = "mean", geom = "point", size = 5, aes(shape = genotype, color = genotype)) +
+      geom_jitter(width = 0.03, size = point.size, shape = 21, aes(fill = genotype)) +
+      stat_pvalue_manual(paired.t.plot(), label = "{p}", size = p.val.size, bracket.nudge.y = input$r.p.val.pos) +
+      scale_fill_manual(values = alpha(cbp.Genotype, 0.25), name = NULL, labels = input$r.scale.labels) +
+      scale_colour_manual(values = cbp.Genotype, name = NULL, labels = input$r.scale.labels) +
+      scale_shape_manual(values = c(7,10), name = NULL, labels = input$r.scale.labels) +
+      labs(y = input$r.y.label,
+       x = NULL) + # can use element_blank for no label at all
+      scale_x_discrete(breaks = NULL) +
+      scale_y_continuous(limits = r.y.limits()) + #guide + "axis_minor" from ggh4x package
+      guides(color = guide_legend(override.aes = list(size = legend.size))) +
+      coord_cartesian(clip = "off")
+  })
+}
+
+ratio.plot <- fun_ratio_plot(point.size = 4, p.val.size = 6, legend.size = 5)
+renderPlot(ratio.plot() + theme_Tim(base.size = 20))
+```
+
+### Saving the Plot 
+``` {r saving_ratio, echo = FALSE}
+## ADD REACTIVE HERE for file name
+inputPanel(
+  textInput("filename", label = "Plot Name", placeholder = "Your input here"),
+  radioButtons("filetype", label = "File Type", choices = c('pdf', 'png','svg')),
+  sliderInput("plot.width", label = "Plot Width, cm", min = 1, max = 12, value = 6, step = 0.5),
+  sliderInput("plot.height", label = "Plot Height, cm", min = 1, max = 8, value = 3, step = 0.5),
+  actionButton("filesave", label = "Save File")
+)
+
+# This event reactive causes the ggsave to wait because it requires input from the reactive filename function. I'm not sure that this is the most efficient, because potentially ggsave should also be eventReactive. Largely, this event reactivity is important so that ggsave does not save a new file for each character that is typed. 
+r.filename.evre <- eventReactive(input$filesave, {
+   paste0(wd.path, "/", input$filename, ".", input$filetype)
+})
+
+# Make this a function later, to then only print a specific plot
+r.print.plot <- fun_ratio_plot()
+r.print.plot2 <- reactive(r.print.plot() + theme_Tim())
+
+reactive(ggsave(plot = r.print.plot2(), filename = r.filename.evre(), device = input$filetype, width = input$plot.width, height = input$plot.height, unit = 'cm', dpi = 300, bg = "transparent")) # back in a previous version of ggsave/svglite, a 1.32 conversion was required because it was printed from 70 to 96dpi conversion factor. Nowadays, this appears to be fixed for all file types, so no requirement to have a dpi conversion factor. Also, .pdf is the preferable 
+```
+
+
+
+
+
